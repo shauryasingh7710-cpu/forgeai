@@ -37,6 +37,8 @@ interface StockResult {
   real: RealIndicators;
   anchored: boolean;
   candles: Candle[];
+  /** Today's official NSE 1-minute session for this stock (null off-hours). */
+  intraday: Candle[] | null;
   signals: Signal[];
   composite: { score: number; zone: string };
   news: { title: string; sentiment: number; source: string }[];
@@ -165,11 +167,13 @@ export default function StockFocus() {
             </div>
           </div>
 
-          {/* Zerodha/Groww-style chart over the anchored series */}
+          {/* Zerodha/Groww-style chart — Today (NSE official 1-min) / 3D / 5D */}
           {data.candles.length > 2 && (
             <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3">
               <PriceChart
                 data={data.candles}
+                intraday={data.intraday}
+                prevClose={data.quote.previousClose}
                 dma50={data.real.dma50}
                 dma200={data.real.dma200}
                 w52High={data.real.w52High}
@@ -215,22 +219,63 @@ export default function StockFocus() {
             ))}
           </div>
 
-          {/* signal mini-cards */}
-          <div className="grid grid-cols-2 gap-2">
-            {data.signals
-              .filter((s) => s.available)
-              .map((s) => (
-                <div key={s.group} className="rounded-lg border border-slate-800 p-2 text-xs" title={s.why}>
-                  <div className="flex justify-between">
-                    <span className="text-slate-300">{s.label}</span>
-                    <span className="font-mono">{s.score >= 0 ? "+" : ""}{s.score.toFixed(1)}</span>
+          {/* verdict + clean per-signal breakdown (why each contributes) */}
+          <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3.5">
+            <div className="flex flex-wrap items-center gap-2">
+              <span
+                className={`rounded-md px-2 py-0.5 text-[11px] font-bold ${
+                  data.composite.score >= 10
+                    ? "bg-emerald-500/15 text-emerald-300"
+                    : data.composite.score >= -10
+                      ? "bg-amber-500/15 text-amber-300"
+                      : "bg-rose-500/15 text-rose-300"
+                }`}
+              >
+                {data.composite.zone} · {data.composite.score > 0 ? "+" : ""}
+                {data.composite.score}
+              </span>
+              <span className="text-[11px] text-slate-500">
+                educational read of today&apos;s tape — not advice
+              </span>
+            </div>
+            <p className="mt-2.5 text-[13px] font-medium leading-relaxed text-slate-100">
+              {data.narrative.headline}
+            </p>
+            <div className="mt-2.5 space-y-2">
+              {data.signals
+                .filter((s) => s.available)
+                .map((s) => (
+                  <div key={s.group} className="rounded-lg border border-slate-800/80 bg-slate-900/50 p-2.5">
+                    <div className="flex items-center gap-2 text-xs">
+                      <span className="font-semibold text-slate-200">{s.label}</span>
+                      <span
+                        className={`font-mono text-[11px] ${s.score >= 0 ? "text-emerald-400" : "text-rose-400"}`}
+                      >
+                        {s.score >= 0 ? "+" : ""}
+                        {s.score.toFixed(1)}
+                      </span>
+                      <span className="ml-auto text-[10px] text-slate-600">weight {s.weight}</span>
+                    </div>
+                    <p className="mt-1 text-[11px] leading-relaxed text-slate-400">{s.why}</p>
+                    {s.readings.length > 0 && (
+                      <div className="mt-1.5 flex flex-wrap gap-1">
+                        {s.readings.slice(0, 4).map((r, i) => (
+                          <span
+                            key={i}
+                            title={`${r.name} at ${r.value} — ${r.note}`}
+                            className="rounded bg-slate-950/80 px-1.5 py-0.5 font-mono text-[10px] text-slate-400"
+                          >
+                            {r.name} {r.value}
+                          </span>
+                        ))}
+                      </div>
+                    )}
                   </div>
-                  <div className="mt-0.5 line-clamp-2 text-[10px] text-slate-500">{s.why}</div>
-                </div>
-              ))}
+                ))}
+            </div>
           </div>
 
-          <p className="text-xs leading-relaxed text-slate-300">{data.narrative.body}</p>
+          <FullNarrative body={data.narrative.body} />
 
           {data.news.length > 0 && (
             <div>
@@ -252,8 +297,9 @@ export default function StockFocus() {
 
           <div className="text-[10px] leading-relaxed text-slate-600">
             Levels, DMAs, 52-week range, volumes and horizon changes are the live published values
-            (MoneyControl). Indicator scores are computed on a series anchored to those exact
-            values and are labeled approximations · fetched in {data.fetchedInMs} ms.
+            (MoneyControl). Today's 1-minute chart is NSE's official feed when the market is open.
+            Indicator scores are computed on a series anchored to those exact values and are labeled
+            approximations · fetched in {data.fetchedInMs} ms.
           </div>
         </div>
       )}
@@ -263,6 +309,40 @@ export default function StockFocus() {
           Pick or type a stock to see its real indicator levels — DMAs, 52-week range, volumes,
           performance horizons — with an educational score and plain-English explanation.
         </p>
+      )}
+    </div>
+  );
+}
+
+/** Expandable full explanation (the stock's complete grounded narrative). */
+function FullNarrative({ body }: { body: string }) {
+  const [open, setOpen] = useState(false);
+  const lines = body.split("\n").map((l) => l.trim()).filter(Boolean);
+  const headline = lines[0] ?? "";
+  const rest = lines.slice(1);
+  return (
+    <div className="rounded-xl border border-slate-800 bg-slate-950/40">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center justify-between px-3.5 py-2.5 text-left"
+      >
+        <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+          Full explanation
+        </span>
+        <span className={`text-xs text-slate-500 transition-transform ${open ? "rotate-180" : ""}`}>▾</span>
+      </button>
+      {open && (
+        <div className="space-y-2 border-t border-slate-800/70 px-3.5 pb-3.5 pt-2.5">
+          <p className="text-[13px] font-medium leading-relaxed text-slate-100">{headline}</p>
+          {rest.map((l, i) => (
+            <p
+              key={i}
+              className={`text-[11.5px] leading-relaxed ${l.startsWith("•") ? "pl-2 text-slate-300" : "text-slate-400"}`}
+            >
+              {l}
+            </p>
+          ))}
+        </div>
       )}
     </div>
   );

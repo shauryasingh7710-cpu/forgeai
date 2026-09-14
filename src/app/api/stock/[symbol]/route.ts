@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { resolveStock } from "@/lib/data/market";
 import { mcCandles } from "@/lib/data/moneycontrol";
+import { getNseIntraday } from "@/lib/data/nseIntraday";
 import { getStockNews } from "@/lib/data/news";
 import { trendSignal } from "@/lib/signals/trend";
 import { momentumSignal } from "@/lib/signals/momentum";
@@ -31,6 +32,19 @@ export async function GET(
     // ONE resolve (cached 24h) + ONE pricefeed call (cached 3 min).
     const { snap } = await resolveStock(query);
     const { quote, real, closes, volumes } = snap;
+
+    // NSE's official intraday minute session for THIS stock (needs the NSE
+    // symbol — MC's NSEID field carries it). Fails soft to daily-only views.
+    const nseSymbol = typeof quote.symbol === "string" ? quote.symbol : "";
+    let intraday: Awaited<ReturnType<typeof getNseIntraday>> | null = null;
+    if (/^[A-Z0-9&.-]{1,20}$/.test(nseSymbol) && nseSymbol !== "NIFTYBEES") {
+      try {
+        const s = await getNseIntraday(nseSymbol, false);
+        if (s.minutes.length >= 2) intraday = s;
+      } catch {
+        intraday = null;
+      }
+    }
 
     // Stock news in parallel with nothing else — it's already the second call.
     let news: NewsItem[] = [];
@@ -88,7 +102,10 @@ export async function GET(
     });
 
     const prompt = buildPrompt(payload);
-    const { narrative, latencyMs, failureClass } = await generateNarrative(payload);
+    const { narrative, latencyMs, failureClass } = await generateNarrative(
+      payload,
+      `stock:${quote.symbol}|${composite.score}|${new Date().toISOString().slice(0, 13)}`,
+    );
     const evaluators = runEvaluators(payload, narrative);
     const guardrailTriggered = !(evaluators.find((e) => e.name === "advice_safety")?.passed ?? true);
     const session = recordSession({
@@ -108,6 +125,7 @@ export async function GET(
       real, // the REAL published indicators (DMAs, 52w, volumes, horizon changes)
       anchored: true,
       candles: mcCandles(snap), // anchored series for the chart
+      intraday: intraday ? intraday.candles : null,
       signals,
       composite,
       news,

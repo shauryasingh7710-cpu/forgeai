@@ -120,7 +120,8 @@ async function callGeminiChat(
         },
       );
       if (!res.ok) {
-        if (res.status === 429 || res.status === 503) continue; // retry
+        if (res.status === 429) break; // quota exhausted — fail fast to template (rejected calls still burn quota)
+        if (res.status === 503) continue; // transient capacity — retry ok
         return null;
       }
     const json = (await res.json()) as {

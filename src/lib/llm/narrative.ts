@@ -43,11 +43,15 @@ const VALID_GROUPS = new Set([
   "trend", "momentum", "volatility", "volume", "structure", "global", "news", "flows",
 ]);
 
+/** Why the last Gemini call failed — used for honest UI disclosure. */
+let lastGeminiFail: "429" | "error" | null = null;
+
 async function callGemini(payload: SignalPayload): Promise<Narrative | null> {
   const key = process.env.GEMINI_API_KEY;
   if (!key) return null;
+  lastGeminiFail = null;
 
-  // Retries for transient Google capacity errors (429/503) — the free tier
+  // Retries for transient Google capacity errors (503) — the free tier
   // model intermittently answers "high demand, try again later".
   for (let attempt = 0; attempt < 3; attempt++) {
     if (attempt > 0) await new Promise((r) => setTimeout(r, attempt === 1 ? 800 : 2000));
@@ -75,7 +79,15 @@ async function callGemini(payload: SignalPayload): Promise<Narrative | null> {
         },
       );
       if (!res.ok) {
-        if (res.status === 429 || res.status === 503) continue; // retry once
+        // 429 = quota exhausted (free tier: 20 req/min). Retrying BURNS more
+        // quota since rejected calls still count — fail fast to the template;
+        // the next natural call after the minute window succeeds.
+        if (res.status === 429) {
+          lastGeminiFail = "429";
+          return null;
+        }
+        if (res.status === 503) continue; // transient capacity — retry ok
+        lastGeminiFail = "error";
         return null;
       }
     const json = (await res.json()) as {
@@ -88,7 +100,10 @@ async function callGemini(payload: SignalPayload): Promise<Narrative | null> {
     if (!text) continue;
 
     const parsed = LlmSchema.safeParse(JSON.parse(text));
-    if (!parsed.success) return null;
+    if (!parsed.success) {
+      lastGeminiFail = "error";
+      return null;
+    }
 
     const cited = parsed.data.citedGroups.filter((g) => VALID_GROUPS.has(g)) as Narrative["citedGroups"];
     if (cited.length === 0) return null;
@@ -185,12 +200,22 @@ export interface NarrativeResult {
 
 /** Generate a narrative: LLM if possible, template otherwise. Safety filter always runs.
  *  A short TTL cache (same score + same hour) keeps dashboard reloads instant and
- *  saves Gemini quota — the market read barely changes within minutes. */
+ *  saves Gemini quota — the market read barely changes within minutes.
+ *  Pass `cacheKey` (e.g. a stock symbol + score) to cache additional variants —
+ *  Stock Focus re-fetches on every keystroke, and each miss costs quota. */
 let narrCache: { key: string; at: number; result: NarrativeResult } | null = null;
+const narrCacheMap = new Map<string, { at: number; result: NarrativeResult }>();
+const NARR_CACHE_TTL = 5 * 60 * 1000;
 
-export async function generateNarrative(payload: SignalPayload): Promise<NarrativeResult> {
-  const cacheKey = `${payload.composite.score}|${payload.asOf.slice(0, 13)}`;
-  if (narrCache && narrCache.key === cacheKey && Date.now() - narrCache.at < 5 * 60 * 1000) {
+export async function generateNarrative(
+  payload: SignalPayload,
+  cacheKey?: string,
+): Promise<NarrativeResult> {
+  const key = cacheKey ?? `${payload.composite.score}|${payload.asOf.slice(0, 13)}`;
+  if (cacheKey) {
+    const hit = narrCacheMap.get(key);
+    if (hit && Date.now() - hit.at < NARR_CACHE_TTL) return hit.result;
+  } else if (narrCache && narrCache.key === key && Date.now() - narrCache.at < NARR_CACHE_TTL) {
     return narrCache.result;
   }
   const started = Date.now();
@@ -204,9 +229,11 @@ export async function generateNarrative(payload: SignalPayload): Promise<Narrati
     failureClass = null;
   } else {
     narrative = templateNarrative(payload);
-    failureClass = process.env.GEMINI_API_KEY
-      ? "llm_call_failed_template_fallback"
-      : "llm_not_configured_template_fallback";
+    failureClass = !process.env.GEMINI_API_KEY
+      ? "llm_not_configured_template_fallback"
+      : lastGeminiFail === "429"
+        ? "llm_quota_exhausted_template_fallback"
+        : "llm_call_failed_template_fallback";
   }
 
   // Advice-safety filter runs on every path (defense in depth).
@@ -220,6 +247,11 @@ export async function generateNarrative(payload: SignalPayload): Promise<Narrati
   }
 
   const result = { narrative, llmAvailable: narrative.source === "llm", latencyMs, failureClass };
-  narrCache = { key: cacheKey, at: Date.now(), result };
+  if (cacheKey) {
+    if (narrCacheMap.size > 50) narrCacheMap.clear();
+    narrCacheMap.set(key, { at: Date.now(), result });
+  } else {
+    narrCache = { key, at: Date.now(), result };
+  }
   return result;
 }

@@ -20,6 +20,8 @@ import {
   SECTOR_INDICES,
 } from "./data/market";
 import { getGiftNifty, getWorldIndices, toQuotes } from "./data/worldIndices";
+import { getSensexQuote } from "./data/bse";
+import { getNseIntraday } from "./data/nseIntraday";
 import { SCENARIO_PRESETS, clampAbs, parseScenario, type Scenario } from "./data/scenario";
 import { getNiftyAnchors } from "./data/nse";
 import { getMarketNews } from "./data/news";
@@ -37,6 +39,7 @@ import { buildPrompt, generateNarrative } from "./llm/narrative";
 import { runEvaluators } from "./prism/evaluators";
 import { recordSession } from "./prism/session";
 import type {
+  Candle,
   FiiDiiData,
   Narrative,
   NewsItem,
@@ -50,6 +53,10 @@ import type {
 export interface PulseResult {
   asOf: string;
   indices: Quote[];
+  /** BSE Sensex — from TradingView's scanner (BSE's own API is bot-blocked). */
+  sensex: Quote | null;
+  /** Today's official NSE 1-minute session for the Overview chart (null off-hours). */
+  niftyIntraday: { minutes: number; candles: Candle[] } | null;
   world: Quote[];
   giftNifty: Quote | null;
   global: Quote[];
@@ -77,7 +84,7 @@ export async function computePulse(options?: {
   const scenario: Scenario | null = parseScenario(options?.scenario);
 
   // ---- 1. Data fetch: ONE parallel batch (all cached, all fail-soft) ----
-  const [niftyRes, vixRes, newsRes, flowsRes, anchorsRes, globalRes, indianRes, sectorRes, etfRes, worldRes, giftRes] =
+  const [niftyRes, vixRes, newsRes, flowsRes, anchorsRes, globalRes, indianRes, sectorRes, etfRes, worldRes, giftRes, sensexRes, intradayRes] =
     await Promise.allSettled([
       getNiftySeries(),
       getVixQuote(),
@@ -90,7 +97,20 @@ export async function computePulse(options?: {
       getStockSnapshot("NIFTYBEES"),
       getWorldIndices(),
       getGiftNifty(),
+      getSensexQuote(),
+      getNseIntraday("NIFTY 50", true),
     ]);
+
+  const sensex = sensexRes.status === "fulfilled" ? sensexRes.value : null;
+  if (!sensex) warnings.push("BSE Sensex unavailable right now (TradingView scanner unreachable).");
+
+  // Official NSE minute session — null off-hours so the UI falls back to the
+  // 3-day daily view instead of showing an empty Today chart.
+  const intradaySession = intradayRes.status === "fulfilled" ? intradayRes.value : null;
+  const niftyIntraday =
+    intradaySession && intradaySession.minutes.length >= 2
+      ? { minutes: intradaySession.minutes.length, candles: intradaySession.candles }
+      : null;
 
   if (niftyRes.status === "rejected") {
     throw new Error(
@@ -259,7 +279,13 @@ export async function computePulse(options?: {
   });
 
   if (narrative.source !== "llm") {
-    warnings.push("AI explanation served from the deterministic template — add GEMINI_API_KEY for LLM narratives.");
+    warnings.push(
+      failureClass === "llm_quota_exhausted_template_fallback"
+        ? "Gemini's free-tier quota is exhausted right now (20 requests/min) — showing the deterministic template explanation; it will upgrade automatically as the quota window resets."
+        : failureClass === "llm_call_failed_template_fallback"
+          ? "Gemini couldn't answer just now (network/latency) — showing the deterministic template explanation."
+          : "AI explanation served from the deterministic template — add GEMINI_API_KEY for LLM narratives.",
+    );
   }
 
   // Anchored Nifty series → Overview chart. Candles are formed from the
@@ -306,6 +332,8 @@ export async function computePulse(options?: {
   return {
     asOf: new Date().toISOString(),
     indices: indianQuotes,
+    sensex,
+    niftyIntraday,
     world,
     giftNifty: giftAsQuote,
     global: global.quotes,

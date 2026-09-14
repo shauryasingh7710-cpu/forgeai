@@ -140,12 +140,15 @@ export default function Dashboard({ pulse }: Props) {
                   </div>
                   <PriceChart
                     data={view.niftyCandles}
+                    intraday={view.niftyIntraday?.candles ?? null}
+                    prevClose={view.indices[0]?.previousClose ?? null}
                     height={210}
                     defaultStyle="line"
                   />
                   <p className="mt-1 text-[10px] leading-relaxed text-slate-600">
-                    Anchored series — closes exact at published levels; intraday shape approximate
-                    (disclosed in the warnings above).
+                    {view.niftyIntraday
+                      ? "Today's session from NSE's official 1-minute feed — live during market hours (09:15–15:30 IST)."
+                      : "3-day view while markets are closed — Today's minute session appears when NSE opens. Daily closes are exact at published levels."}
                   </p>
                 </div>
                 {view.sectors.length > 0 && (
@@ -222,7 +225,7 @@ export default function Dashboard({ pulse }: Props) {
               <h2 className="mb-3 text-sm font-semibold uppercase tracking-wider text-slate-400">
                 India — headline indices
               </h2>
-              <MarketStrip title="" quotes={view.indices} />
+              <MarketStrip title="" quotes={view.sensex ? [view.sensex, ...view.indices] : view.indices} />
             </div>
             {view.sectors.length > 0 && (
               <div>
