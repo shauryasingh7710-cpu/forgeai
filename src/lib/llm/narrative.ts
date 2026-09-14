@@ -11,6 +11,7 @@
 import { z } from "zod";
 import type { Narrative, SignalPayload } from "@/lib/data/types";
 import { filterAdviceLanguage, narrativeSafetyCheck } from "@/lib/prism/evaluators";
+import { currentModel, geminiGenerate, lastFail } from "./gemini";
 
 const LlmSchema = z.object({
   headline: z.string().min(8).max(140),
@@ -19,7 +20,7 @@ const LlmSchema = z.object({
   citedGroups: z.array(z.string()).min(1).max(6),
 });
 
-export const MODEL_NAME = process.env.GEMINI_MODEL ?? "gemini-3.6-flash";
+export const MODEL_NAME = process.env.GEMINI_MODEL ?? currentModel();
 
 export function buildPrompt(payload: SignalPayload): string {
   return [
@@ -43,87 +44,33 @@ const VALID_GROUPS = new Set([
   "trend", "momentum", "volatility", "volume", "structure", "global", "news", "flows",
 ]);
 
-/** Why the last Gemini call failed — used for honest UI disclosure. */
-let lastGeminiFail: "429" | "error" | null = null;
-
+/**
+ * Generate the narrative via the shared Gemini client (model fallback chain
+ * lives in ./gemini — free-tier quota is per-model, so a drained bucket on
+ * the primary model transparently tries the next one).
+ */
 async function callGemini(payload: SignalPayload): Promise<Narrative | null> {
-  const key = process.env.GEMINI_API_KEY;
-  if (!key) return null;
-  lastGeminiFail = null;
+  const result = await geminiGenerate(buildPrompt(payload));
+  if (!result) return null;
 
-  // Retries for transient Google capacity errors (503) — the free tier
-  // model intermittently answers "high demand, try again later".
-  for (let attempt = 0; attempt < 3; attempt++) {
-    if (attempt > 0) await new Promise((r) => setTimeout(r, attempt === 1 ? 800 : 2000));
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15000);
-    try {
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${key}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          signal: controller.signal,
-          cache: "no-store",
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: buildPrompt(payload) }] }],
-            generationConfig: {
-              temperature: 0.4,
-              responseMimeType: "application/json",
-              // This is a structured re-explanation of provided data, not a
-              // reasoning task — thinking burns ~1.5k tokens and seconds of
-              // latency for no quality gain here.
-              thinkingConfig: { thinkingBudget: 0 },
-            },
-          }),
-        },
-      );
-      if (!res.ok) {
-        // 429 = quota exhausted (free tier: 20 req/min). Retrying BURNS more
-        // quota since rejected calls still count — fail fast to the template;
-        // the next natural call after the minute window succeeds.
-        if (res.status === 429) {
-          lastGeminiFail = "429";
-          return null;
-        }
-        if (res.status === 503) continue; // transient capacity — retry ok
-        lastGeminiFail = "error";
-        return null;
-      }
-    const json = (await res.json()) as {
-      candidates?: { content?: { parts?: { text?: string }[] } }[];
-    };
-    // Thinking models may split output across parts — join every text part.
-    const text = (json.candidates?.[0]?.content?.parts ?? [])
-      .map((p) => p.text ?? "")
-      .join("");
-    if (!text) continue;
-
-    const parsed = LlmSchema.safeParse(JSON.parse(text));
-    if (!parsed.success) {
-      lastGeminiFail = "error";
-      return null;
-    }
+  try {
+    const parsed = LlmSchema.safeParse(JSON.parse(result.text));
+    if (!parsed.success) return null;
 
     const cited = parsed.data.citedGroups.filter((g) => VALID_GROUPS.has(g)) as Narrative["citedGroups"];
     if (cited.length === 0) return null;
 
-    const narrative: Narrative = {
+    return {
       headline: parsed.data.headline,
       body: parsed.data.body,
       watchList: parsed.data.watchList.slice(0, 3),
       citedGroups: cited,
       source: "llm",
-      model: MODEL_NAME,
+      model: result.model,
     };
-    return narrative;
-    } catch {
-      continue; // transient error (timeout/network) — retry once
-    } finally {
-      clearTimeout(timer);
-    }
+  } catch {
+    return null; // malformed JSON — template takes over
   }
-  return null;
 }
 
 export function templateNarrative(payload: SignalPayload): Narrative {
@@ -203,9 +150,12 @@ export interface NarrativeResult {
  *  saves Gemini quota — the market read barely changes within minutes.
  *  Pass `cacheKey` (e.g. a stock symbol + score) to cache additional variants —
  *  Stock Focus re-fetches on every keystroke, and each miss costs quota. */
-let narrCache: { key: string; at: number; result: NarrativeResult } | null = null;
-const narrCacheMap = new Map<string, { at: number; result: NarrativeResult }>();
-const NARR_CACHE_TTL = 5 * 60 * 1000;
+let narrCache: { key: string; at: number; ttl: number; result: NarrativeResult } | null = null;
+const narrCacheMap = new Map<string, { at: number; ttl: number; result: NarrativeResult }>();
+/** Successful LLM narratives are stable for minutes; template fallbacks are
+ *  NOT — a short TTL lets the system retry Gemini as soon as quota recovers. */
+const NARR_CACHE_TTL_LLM = 5 * 60 * 1000;
+const NARR_CACHE_TTL_TEMPLATE = 60 * 1000;
 
 export async function generateNarrative(
   payload: SignalPayload,
@@ -214,8 +164,8 @@ export async function generateNarrative(
   const key = cacheKey ?? `${payload.composite.score}|${payload.asOf.slice(0, 13)}`;
   if (cacheKey) {
     const hit = narrCacheMap.get(key);
-    if (hit && Date.now() - hit.at < NARR_CACHE_TTL) return hit.result;
-  } else if (narrCache && narrCache.key === key && Date.now() - narrCache.at < NARR_CACHE_TTL) {
+    if (hit && Date.now() - hit.at < hit.ttl) return hit.result;
+  } else if (narrCache && narrCache.key === key && Date.now() - narrCache.at < narrCache.ttl) {
     return narrCache.result;
   }
   const started = Date.now();
@@ -231,7 +181,7 @@ export async function generateNarrative(
     narrative = templateNarrative(payload);
     failureClass = !process.env.GEMINI_API_KEY
       ? "llm_not_configured_template_fallback"
-      : lastGeminiFail === "429"
+      : lastFail === "all_models_quota"
         ? "llm_quota_exhausted_template_fallback"
         : "llm_call_failed_template_fallback";
   }
@@ -247,11 +197,12 @@ export async function generateNarrative(
   }
 
   const result = { narrative, llmAvailable: narrative.source === "llm", latencyMs, failureClass };
+  const ttl = narrative.source === "llm" ? NARR_CACHE_TTL_LLM : NARR_CACHE_TTL_TEMPLATE;
   if (cacheKey) {
     if (narrCacheMap.size > 50) narrCacheMap.clear();
-    narrCacheMap.set(key, { at: Date.now(), result });
+    narrCacheMap.set(key, { at: Date.now(), ttl, result });
   } else {
-    narrCache = { key, at: Date.now(), result };
+    narrCache = { key, at: Date.now(), ttl, result };
   }
   return result;
 }

@@ -13,6 +13,7 @@ import { z } from "zod";
 import type { Narrative, SignalPayload } from "@/lib/data/types";
 import { filterAdviceLanguage, narrativeSafetyCheck } from "@/lib/prism/evaluators";
 import { MODEL_NAME } from "./narrative";
+import { geminiGenerate, lastFail } from "./gemini";
 
 export type ChatIntent =
   | "advice_refusal"
@@ -92,54 +93,16 @@ async function callGeminiChat(
   question: string,
   history: ChatTurn[],
 ): Promise<{ answer: string } | null> {
-  const key = process.env.GEMINI_API_KEY;
-  if (!key) return null;
-
-  // Retry transient Google capacity errors (429/503) — the free tier
-  // intermittently answers "high demand, try again later".
-  for (let attempt = 0; attempt < 3; attempt++) {
-    if (attempt > 0) await new Promise((r) => setTimeout(r, attempt === 1 ? 800 : 2000));
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15000);
-    try {
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${key}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          signal: controller.signal,
-          cache: "no-store",
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: buildChatPrompt(payload, question, history) }] }],
-            generationConfig: {
-              temperature: 0.4,
-              responseMimeType: "application/json",
-              thinkingConfig: { thinkingBudget: 0 }, // structured task, skip hidden reasoning tokens
-            },
-          }),
-        },
-      );
-      if (!res.ok) {
-        if (res.status === 429) break; // quota exhausted — fail fast to template (rejected calls still burn quota)
-        if (res.status === 503) continue; // transient capacity — retry ok
-        return null;
-      }
-    const json = (await res.json()) as {
-      candidates?: { content?: { parts?: { text?: string }[] } }[];
-    };
-    const text = (json.candidates?.[0]?.content?.parts ?? [])
-      .map((p) => p.text ?? "")
-      .join("");
-    if (!text) return null;
-      const parsed = ChatSchema.safeParse(JSON.parse(text));
-      return parsed.success ? { answer: parsed.data.answer } : null;
-    } catch {
-      continue; // transient (timeout/network) — retry
-    } finally {
-      clearTimeout(timer);
-    }
+  // The shared client handles the model fallback chain (free-tier quota is
+  // per-model); chat only validates the shape.
+  const result = await geminiGenerate(buildChatPrompt(payload, question, history));
+  if (!result) return null;
+  try {
+    const parsed = ChatSchema.safeParse(JSON.parse(result.text));
+    return parsed.success ? { answer: parsed.data.answer } : null;
+  } catch {
+    return null; // malformed JSON — template takes over
   }
-  return null;
 }
 
 // ------------------------------------------------------- template path -----
@@ -277,9 +240,11 @@ export async function answerChat(
   } else {
     text = templateAnswer(payload, intent);
     source = "template";
-    failureClass = process.env.GEMINI_API_KEY
-      ? "chat_llm_failed_template_fallback"
-      : "chat_llm_not_configured_template_fallback";
+    failureClass = !process.env.GEMINI_API_KEY
+      ? "chat_llm_not_configured_template_fallback"
+      : lastFail === "all_models_quota"
+        ? "chat_llm_quota_exhausted_template_fallback"
+        : "chat_llm_failed_template_fallback";
   }
 
   // Advice-safety filter on every path (defense in depth), same as narratives.
@@ -293,7 +258,14 @@ export async function answerChat(
   const check = narrativeSafetyCheck(probe);
   if (!check.passed) text = filterAdviceLanguage(text);
 
-  return { text, intent, source, model: source === "llm" ? MODEL_NAME : "template-engine", latencyMs, failureClass };
+  return {
+    text,
+    intent,
+    source,
+    model: source === "llm" ? MODEL_NAME : "template-engine",
+    latencyMs,
+    failureClass,
+  };
 }
 
 /** The two quality gates that apply to every chat reply. */
