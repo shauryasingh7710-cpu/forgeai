@@ -12,6 +12,8 @@
  * values are approximations, levels and changes are exact. `degraded` marks
  * this so the UI can disclose it.
  */
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import path from "node:path";
 import { cached } from "./cache";
 import { canUse, recordFailure, recordSuccess } from "./circuitBreaker";
 
@@ -120,36 +122,81 @@ async function nseGet(path: string): Promise<unknown> {
   return res.json();
 }
 
+/**
+ * Disk-persisted "last good" snapshot: a server restart wipes the in-memory
+ * cache, but judges shouldn't see a dead dashboard because NSE is doing
+ * late-night maintenance. Every successful fetch is persisted; on total
+ * failure (incl. circuit-open) we serve the snapshot for up to 12 hours.
+ */
+const SNAPSHOT_DIR = path.join(process.cwd(), ".cache");
+const SNAPSHOT_FILE = path.join(SNAPSHOT_DIR, "nse-allIndices.json");
+const SNAPSHOT_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+
+function readSnapshot(): NseIndexRow[] | null {
+  try {
+    const raw = JSON.parse(readFileSync(SNAPSHOT_FILE, "utf8")) as {
+      savedAt: number;
+      rows: NseIndexRow[];
+    };
+    if (Date.now() - raw.savedAt > SNAPSHOT_MAX_AGE_MS) return null;
+    return Array.isArray(raw.rows) && raw.rows.length > 0 ? raw.rows : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeSnapshot(rows: NseIndexRow[]): void {
+  try {
+    mkdirSync(SNAPSHOT_DIR, { recursive: true });
+    writeFileSync(SNAPSHOT_FILE, JSON.stringify({ savedAt: Date.now(), rows }));
+  } catch {
+    // best-effort only
+  }
+}
+
 /** Fetch and cache the full allIndices table (one network call per TTL). */
 export async function getNseAllIndices(): Promise<NseIndexRow[]> {
   const { value } = await cached("nse:allIndices", 5 * 60 * 1000, async () => {
-    if (!canUse("nse")) throw new Error("nse circuit open");
+    const attempt = async (): Promise<NseIndexRow[]> => {
+      if (!canUse("nse")) throw new Error("nse circuit open");
+      try {
+        const json = (await nseGet("/api/allIndices")) as AllIndicesResponse;
+        const rows = (json.data ?? [])
+          .filter((r) => typeof r.index === "string" && typeof r.last === "number")
+          .map((r) => ({
+            index: r.index!,
+            last: r.last!,
+            variation: r.variation ?? 0,
+            percentChange: r.percentChange ?? 0,
+            previousClose: r.previousClose ?? r.last! - (r.variation ?? 0),
+            open: r.open ?? r.last!,
+            yearHigh: r.yearHigh ?? r.last!,
+            yearLow: r.yearLow ?? r.last!,
+            advances: r.advances ?? 0,
+            declines: r.declines ?? 0,
+            unchanged: r.unchanged ?? 0,
+            perChange30d: typeof r.perChange30d === "number" ? r.perChange30d : null,
+            perChange365d: typeof r.perChange365d === "number" ? r.perChange365d : null,
+            oneWeekAgoVal: typeof r.oneWeekAgoVal === "number" && r.oneWeekAgoVal > 0 ? r.oneWeekAgoVal : null,
+          }));
+        if (rows.length === 0) throw new Error("nse allIndices empty");
+        recordSuccess("nse");
+        writeSnapshot(rows);
+        return rows;
+      } catch (err) {
+        recordFailure("nse");
+        throw err;
+      }
+    };
     try {
-      const json = (await nseGet("/api/allIndices")) as AllIndicesResponse;
-      const rows = (json.data ?? [])
-        .filter((r) => typeof r.index === "string" && typeof r.last === "number")
-        .map((r) => ({
-          index: r.index!,
-          last: r.last!,
-          variation: r.variation ?? 0,
-          percentChange: r.percentChange ?? 0,
-          previousClose: r.previousClose ?? r.last! - (r.variation ?? 0),
-          open: r.open ?? r.last!,
-          yearHigh: r.yearHigh ?? r.last!,
-          yearLow: r.yearLow ?? r.last!,
-          advances: r.advances ?? 0,
-          declines: r.declines ?? 0,
-          unchanged: r.unchanged ?? 0,
-          perChange30d: typeof r.perChange30d === "number" ? r.perChange30d : null,
-          perChange365d: typeof r.perChange365d === "number" ? r.perChange365d : null,
-          oneWeekAgoVal: typeof r.oneWeekAgoVal === "number" && r.oneWeekAgoVal > 0 ? r.oneWeekAgoVal : null,
-        }));
-      if (rows.length === 0) throw new Error("nse allIndices empty");
-      recordSuccess("nse");
-      return rows;
-    } catch (err) {
-      recordFailure("nse");
-      throw err;
+      return await attempt();
+    } catch {
+      // Total failure: serve the last good table from disk instead of dying.
+      const snap = readSnapshot();
+      if (snap) return snap;
+      throw new Error(
+        "NSE is unreachable right now and no previous snapshot exists on this machine yet — try again in a few minutes",
+      );
     }
   });
   return value;

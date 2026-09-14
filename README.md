@@ -80,11 +80,24 @@ npm install
 npm run dev        # http://localhost:3000
 ```
 
-Optional — real LLM narratives (otherwise the deterministic template is used):
+Optional — real LLM narratives **and the chat assistant** (otherwise the deterministic
+grounded template is used for both):
 
 ```bash
 cp .env.example .env.local   # add GEMINI_API_KEY (free tier at aistudio.google.com)
 ```
+
+## Chat assistant
+
+The floating 💬 button (bottom-right) opens **Ask MarketPulse** — a chat that answers
+questions about today's computed signals under the same rules as the daily explanation:
+
+- **Grounded**: the model sees only the `SignalPayload`; every reply is checked by the
+  groundedness + advice-safety evaluators (badges shown on each reply)
+- **Advice-refusing**: "should I buy X?" gets an educational refusal with the real data
+- **Zero-key mode**: works instantly on a deterministic template; add `GEMINI_API_KEY`
+  and the same questions upgrade to Gemini answers — no code changes
+- Every chat turn is traced to PRISM with the same schema as narrative runs
 
 ## Scripts
 

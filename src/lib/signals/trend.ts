@@ -17,7 +17,7 @@ export function trendSignal(ctx: SignalContext): SignalOutput {
   const base = {
     group: "trend" as const,
     label: "Trend",
-    weight: 18,
+    weight: 6, // background context — the day's action leads the composite
   };
 
   if (closes.length < 210) {

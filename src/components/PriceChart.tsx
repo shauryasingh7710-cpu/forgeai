@@ -10,14 +10,25 @@ interface Props {
   w52High?: number | null;
   w52Low?: number | null;
   height?: number;
+  defaultStyle?: "line" | "candles";
 }
 
 const UP = "#22c55e";
 const DOWN = "#ef4444";
 
-export default function PriceChart({ data, dma50, dma200, w52High, w52Low, height = 260 }: Props) {
+export default function PriceChart({
+  data,
+  dma50,
+  dma200,
+  w52High,
+  w52Low,
+  height = 260,
+  defaultStyle = "candles",
+}: Props) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const [hover, setHover] = useState<{ x: number; candle: Candle; i: number } | null>(null);
+  const [range, setRange] = useState(120);
+  const [style, setStyle] = useState<"line" | "candles">(defaultStyle);
   const W = 800;
   const H = height;
   const padR = 56; // right-side price axis (like Zerodha/Groww)
@@ -26,7 +37,10 @@ export default function PriceChart({ data, dma50, dma200, w52High, w52Low, heigh
   const volTop = priceH + 18;
   const volH = H - volTop - 6;
 
-  const view = useMemo(() => data.slice(-120), [data]);
+  const view = useMemo(
+    () => (range >= data.length ? data : data.slice(-range)),
+    [data, range],
+  );
 
   const { candles, min, max, vols, volMax } = useMemo(() => {
     const view2 = view;
@@ -92,6 +106,35 @@ export default function PriceChart({ data, dma50, dma200, w52High, w52Low, heigh
 
   return (
     <div className="relative" ref={wrapRef}>
+      {/* range + style controls (Zerodha/Groww pattern) */}
+      <div className="mb-1.5 flex items-center gap-1.5">
+        {[30, 60, 120, data.length].map((r, i) => (
+          <button
+            key={`${r}-${i}`}
+            onClick={() => setRange(r)}
+            className={`rounded-md border px-2 py-0.5 text-[10px] font-medium transition ${
+              range === r
+                ? "border-cyan-600/60 bg-cyan-500/10 text-cyan-300"
+                : "border-slate-800 text-slate-500 hover:text-slate-300"
+            }`}
+          >
+            {r >= data.length ? "Max" : `${r}D`}
+          </button>
+        ))}
+        <div className="ml-auto flex overflow-hidden rounded-md border border-slate-800">
+          {(["candles", "line"] as const).map((s) => (
+            <button
+              key={s}
+              onClick={() => setStyle(s)}
+              className={`px-2 py-0.5 text-[10px] font-medium transition ${
+                style === s ? "bg-slate-800 text-slate-100" : "text-slate-500 hover:text-slate-300"
+              }`}
+            >
+              {s === "candles" ? "🕯 Candles" : "〽 Line"}
+            </button>
+          ))}
+        </div>
+      </div>
       <svg
         viewBox={`0 0 ${W} ${H}`}
         className="w-full cursor-crosshair select-none"
@@ -140,7 +183,8 @@ export default function PriceChart({ data, dma50, dma200, w52High, w52Low, heigh
         );
         })}
 
-        {/* candles: wick + body */}
+        {/* candles: wick + body (hidden in line style) */}
+        <g style={{ display: style === "candles" ? undefined : "none" }}>
         {candles.map((c, i) => {
           const bw = Math.max(1.5, (W - padR - 12) / view.length - 1);
           const cx = x(i);
@@ -155,9 +199,16 @@ export default function PriceChart({ data, dma50, dma200, w52High, w52Low, heigh
             </g>
           );
         })}
+        </g>
 
-        {/* close line (subtle) */}
-        <path d={closeLine} fill="none" stroke={up ? UP : DOWN} strokeWidth={1.4} opacity={0.85} />
+        {/* close line (subtle) — primary when line style is chosen */}
+        <path
+          d={closeLine}
+          fill="none"
+          stroke={up ? UP : DOWN}
+          strokeWidth={style === "line" ? 2 : 1.4}
+          opacity={style === "line" ? 1 : 0.85}
+        />
 
         {/* DMA overlays — dashed reference lines like the platforms */}
         {dma50 != null && (

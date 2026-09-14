@@ -19,6 +19,8 @@ import {
   INDIAN_INDICES,
   SECTOR_INDICES,
 } from "./data/market";
+import { getGiftNifty, getWorldIndices, toQuotes } from "./data/worldIndices";
+import { SCENARIO_PRESETS, clampAbs, parseScenario, type Scenario } from "./data/scenario";
 import { getNiftyAnchors } from "./data/nse";
 import { getMarketNews } from "./data/news";
 import { getFiiDii } from "./data/fiiDii";
@@ -48,6 +50,8 @@ import type {
 export interface PulseResult {
   asOf: string;
   indices: Quote[];
+  world: Quote[];
+  giftNifty: Quote | null;
   global: Quote[];
   sectors: Quote[];
   vix: { value: number; changePct: number; quote: Quote } | null;
@@ -59,16 +63,21 @@ export interface PulseResult {
   };
   news: NewsItem[];
   flows: FiiDiiData;
+  niftyCandles: { time: number; open: number; high: number; low: number; close: number; volume: number }[];
   narrative: Narrative;
   session: PrismSession;
   warnings: string[];
 }
 
-export async function computePulse(options?: { goal?: string }): Promise<PulseResult> {
+export async function computePulse(options?: {
+  goal?: string;
+  scenario?: string | null;
+}): Promise<PulseResult> {
   const warnings: string[] = [];
+  const scenario: Scenario | null = parseScenario(options?.scenario);
 
   // ---- 1. Data fetch: ONE parallel batch (all cached, all fail-soft) ----
-  const [niftyRes, vixRes, newsRes, flowsRes, anchorsRes, globalRes, indianRes, sectorRes, etfRes] =
+  const [niftyRes, vixRes, newsRes, flowsRes, anchorsRes, globalRes, indianRes, sectorRes, etfRes, worldRes, giftRes] =
     await Promise.allSettled([
       getNiftySeries(),
       getVixQuote(),
@@ -79,6 +88,8 @@ export async function computePulse(options?: { goal?: string }): Promise<PulseRe
       getIndexQuotes(INDIAN_INDICES),
       getIndexQuotes(SECTOR_INDICES),
       getStockSnapshot("NIFTYBEES"),
+      getWorldIndices(),
+      getGiftNifty(),
     ]);
 
   if (niftyRes.status === "rejected") {
@@ -98,9 +109,36 @@ export async function computePulse(options?: { goal?: string }): Promise<PulseRe
   if (!vix) warnings.push("India VIX unavailable right now; volatility uses realized volatility only.");
 
   const anchors = anchorsRes.status === "fulfilled" ? anchorsRes.value : null;
-  const breadth = anchors?.breadth ?? undefined;
+  let breadth = anchors?.breadth ?? undefined;
   const w52High = anchors?.yearHigh ?? null;
   const w52Low = anchors?.yearLow ?? null;
+
+  // ---- 1b. Scenario explorer (disclosed simulation) -----------------------
+  // Reshapes TODAY'S inputs coherently so demos can show the composite react.
+  // Every simulated number derives from the real previous close; the banner
+  // below always tells the user this is simulated.
+  if (scenario) {
+    const p = SCENARIO_PRESETS[scenario];
+    const simLast = niftyQuote.previousClose * (1 + p.dayPct / 100);
+    const simPct = p.dayPct;
+
+    // Nifty closes: keep the REAL previous close, set today to the simulation.
+    niftyCloses[niftyCloses.length - 1] = Math.round(simLast * 100) / 100;
+    niftyQuote.price = Math.round(simLast * 100) / 100;
+    niftyQuote.changePct = simPct;
+    niftyQuote.change = Math.round((simLast - niftyQuote.previousClose) * 100) / 100;
+
+    breadth = { advances: p.adv, declines: p.dec, unchanged: Math.max(0, 50 - p.adv - p.dec) };
+
+    // VIX moves opposite the tape (fear cools on a strong day).
+    if (vix) {
+      const vixChg = Math.round(clampAbs(-simPct * 6, 25) * 100) / 100;
+      vix.value = Math.max(9, Math.round(vix.quote.previousClose * (1 + vixChg / 100) * 100) / 100);
+      vix.changePct = vixChg;
+    }
+
+    warnings.unshift(`🧪 SIMULATION ACTIVE — ${p.label}. Today's Nifty level, breadth and VIX are synthetic (derived from the real previous close); every other source is live.`);
+  }
 
   const indianQuotes = indianRes.status === "fulfilled" ? indianRes.value : [];
   if (indianQuotes.length === 0) warnings.push("Index strip unavailable (NSE table fetch failed).");
@@ -110,6 +148,25 @@ export async function computePulse(options?: { goal?: string }): Promise<PulseRe
   else if (global.note) warnings.push(global.note);
 
   const sectorQuotes = sectorRes.status === "fulfilled" ? sectorRes.value : [];
+
+  // Scenario (cont.): keep every displayed quote row consistent with the
+  // simulated tape (runs after quote declarations; see block above).
+  if (scenario) {
+    const p2 = SCENARIO_PRESETS[scenario];
+    for (const q of indianQuotes) {
+      if (q.symbol === "^NSEI") {
+        q.price = niftyQuote.price;
+        q.changePct = p2.dayPct;
+        q.change = niftyQuote.change;
+      }
+    }
+    for (const q of sectorQuotes) {
+      const pct = Math.round(clampAbs(p2.dayPct * 1.3, 3) * 100) / 100;
+      q.changePct = pct;
+      q.change = Math.round(((q.previousClose * pct) / 100) * 100) / 100;
+      q.price = Math.round(q.previousClose * (1 + pct / 100) * 100) / 100;
+    }
+  }
 
   const news = newsRes.status === "fulfilled" ? newsRes.value : [];
   if (news.length === 0) warnings.push("News feed unavailable; news signal excluded.");
@@ -205,11 +262,55 @@ export async function computePulse(options?: { goal?: string }): Promise<PulseRe
     warnings.push("AI explanation served from the deterministic template — add GEMINI_API_KEY for LLM narratives.");
   }
 
+  // Anchored Nifty series → Overview chart. Candles are formed from the
+  // reconstructed closes (open = prior close, small wick envelope); anchor
+  // levels are exact, path shape is the disclosed approximation.
+  const DAY = 86400;
+  const niftyCandles = niftyCloses.map((close, i) => {
+    const open = i === 0 ? close * (1 - (niftyQuote.changePct / 100)) : niftyCloses[i - 1]!;
+    const hi = Math.max(open, close) * 1.0022;
+    const lo = Math.min(open, close) * 0.9978;
+    return {
+      time: Math.floor(Date.now() / 1000) - (niftyCloses.length - 1 - i) * DAY,
+      open: Math.round(open * 100) / 100,
+      high: Math.round(hi * 100) / 100,
+      low: Math.round(lo * 100) / 100,
+      close: Math.round(close * 100) / 100,
+      volume: 0,
+    };
+  });
+
+  // World indices (Dow, S&P, Nasdaq, FTSE, DAX, CAC, Stoxx, Nikkei, HSI, KOSPI)
+  // + best-effort GIFT Nifty — best-effort, UI discloses if unavailable.
+  const world = worldRes.status === "fulfilled" ? toQuotes(worldRes.value) : [];
+  if (world.length === 0) warnings.push("World indices unavailable right now.");
+  const giftQuote = giftRes.status === "fulfilled" ? giftRes.value : null;
+  const nowMs = Date.now();
+  const giftAsQuote = giftQuote
+    ? (() => {
+        const change = (giftQuote.price * giftQuote.changePct) / 100;
+        return {
+          symbol: giftQuote.symbol,
+          name: `${giftQuote.flag} ${giftQuote.name}`,
+          price: giftQuote.price,
+          previousClose: giftQuote.price - change,
+          change,
+          changePct: giftQuote.changePct,
+          currency: "USD",
+          asOf: nowMs,
+          spark: [] as number[],
+        };
+      })()
+    : null;
+
   return {
     asOf: new Date().toISOString(),
     indices: indianQuotes,
+    world,
+    giftNifty: giftAsQuote,
     global: global.quotes,
     sectors: sectorQuotes,
+    niftyCandles,
     vix,
     signals,
     composite,

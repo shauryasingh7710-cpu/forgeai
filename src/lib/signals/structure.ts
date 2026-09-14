@@ -14,7 +14,7 @@ import {
 
 export function structureSignal(ctx: SignalContext): SignalOutput {
   const closes = ctx.niftyCloses;
-  const base = { group: "structure" as const, label: "Structure", weight: 8 };
+  const base = { group: "structure" as const, label: "Structure", weight: 6 };
 
   const res = closes.length > 60 ? structure({ closes, w52High: ctx.w52High ?? ctx.stock?.w52High ?? null, w52Low: ctx.w52Low ?? ctx.stock?.w52Low ?? null }) : null;
   const subject = ctx.subject ?? "Nifty";

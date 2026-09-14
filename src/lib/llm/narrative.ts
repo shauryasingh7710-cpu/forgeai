@@ -19,7 +19,7 @@ const LlmSchema = z.object({
   citedGroups: z.array(z.string()).min(1).max(6),
 });
 
-export const MODEL_NAME = process.env.GEMINI_MODEL ?? "gemini-2.0-flash";
+export const MODEL_NAME = process.env.GEMINI_MODEL ?? "gemini-3.6-flash";
 
 export function buildPrompt(payload: SignalPayload): string {
   return [
@@ -32,7 +32,7 @@ export function buildPrompt(payload: SignalPayload): string {
     "4. COMPLETENESS: Name the top contributing signal groups from payload.groups and explain why they matter today.",
     "5. AUDIENCE: beginners. Explain any jargon the first time you use it. Short sentences.",
     "Respond with ONLY valid JSON in this exact shape:",
-    '{"headline": string (max 90 chars), "body": string (150-260 words), "watchList": string[3] (what a beginner should watch next, phrased as learning questions or observations), "citedGroups": string[] (group keys you cited, e.g. "trend","volatility")}',
+    '{"headline": string (max 90 chars), "body": string (280-420 words — DEEP and structured: (1) the day\'s overall reading in plain words, (2) the top 3-4 drivers each explained with their exact payload numbers and WHY each matters, (3) one counter-signal — a group that disagrees with the overall zone — if one exists, (4) what a beginner should and should NOT conclude from this), "watchList": string[3] (what a beginner should watch next, phrased as learning questions or observations), "citedGroups": string[] (group keys you cited, e.g. "trend","volatility")}',
     "",
     "PAYLOAD:",
     JSON.stringify(payload),
@@ -47,28 +47,45 @@ async function callGemini(payload: SignalPayload): Promise<Narrative | null> {
   const key = process.env.GEMINI_API_KEY;
   if (!key) return null;
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000);
-  try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${key}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal: controller.signal,
-        cache: "no-store",
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: buildPrompt(payload) }] }],
-          generationConfig: { temperature: 0.4, responseMimeType: "application/json" },
-        }),
-      },
-    );
-    if (!res.ok) return null;
+  // Retries for transient Google capacity errors (429/503) — the free tier
+  // model intermittently answers "high demand, try again later".
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, attempt === 1 ? 800 : 2000));
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${key}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: controller.signal,
+          cache: "no-store",
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: buildPrompt(payload) }] }],
+            generationConfig: {
+              temperature: 0.4,
+              responseMimeType: "application/json",
+              // This is a structured re-explanation of provided data, not a
+              // reasoning task — thinking burns ~1.5k tokens and seconds of
+              // latency for no quality gain here.
+              thinkingConfig: { thinkingBudget: 0 },
+            },
+          }),
+        },
+      );
+      if (!res.ok) {
+        if (res.status === 429 || res.status === 503) continue; // retry once
+        return null;
+      }
     const json = (await res.json()) as {
       candidates?: { content?: { parts?: { text?: string }[] } }[];
     };
-    const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) return null;
+    // Thinking models may split output across parts — join every text part.
+    const text = (json.candidates?.[0]?.content?.parts ?? [])
+      .map((p) => p.text ?? "")
+      .join("");
+    if (!text) continue;
 
     const parsed = LlmSchema.safeParse(JSON.parse(text));
     if (!parsed.success) return null;
@@ -85,11 +102,13 @@ async function callGemini(payload: SignalPayload): Promise<Narrative | null> {
       model: MODEL_NAME,
     };
     return narrative;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
+    } catch {
+      continue; // transient error (timeout/network) — retry once
+    } finally {
+      clearTimeout(timer);
+    }
   }
+  return null;
 }
 
 export function templateNarrative(payload: SignalPayload): Narrative {
@@ -164,8 +183,16 @@ export interface NarrativeResult {
   failureClass: string | null;
 }
 
-/** Generate a narrative: LLM if possible, template otherwise. Safety filter always runs. */
+/** Generate a narrative: LLM if possible, template otherwise. Safety filter always runs.
+ *  A short TTL cache (same score + same hour) keeps dashboard reloads instant and
+ *  saves Gemini quota — the market read barely changes within minutes. */
+let narrCache: { key: string; at: number; result: NarrativeResult } | null = null;
+
 export async function generateNarrative(payload: SignalPayload): Promise<NarrativeResult> {
+  const cacheKey = `${payload.composite.score}|${payload.asOf.slice(0, 13)}`;
+  if (narrCache && narrCache.key === cacheKey && Date.now() - narrCache.at < 5 * 60 * 1000) {
+    return narrCache.result;
+  }
   const started = Date.now();
   const llm = await callGemini(payload);
   const latencyMs = Date.now() - started;
@@ -192,5 +219,7 @@ export async function generateNarrative(payload: SignalPayload): Promise<Narrati
     };
   }
 
-  return { narrative, llmAvailable: narrative.source === "llm", latencyMs, failureClass };
+  const result = { narrative, llmAvailable: narrative.source === "llm", latencyMs, failureClass };
+  narrCache = { key: cacheKey, at: Date.now(), result };
+  return result;
 }

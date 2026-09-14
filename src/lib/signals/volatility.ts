@@ -15,7 +15,7 @@ import {
 
 export function volatilitySignal(ctx: SignalContext): SignalOutput {
   const closes = ctx.niftyCloses;
-  const base = { group: "volatility" as const, label: "Volatility", weight: 15 };
+  const base = { group: "volatility" as const, label: "Volatility", weight: 14 };
 
   const readings: ReturnType<typeof reading>[] = [];
   let parts = 0;
@@ -23,18 +23,11 @@ export function volatilitySignal(ctx: SignalContext): SignalOutput {
 
   const vix = ctx.vix;
   if (vix && vix.value > 0) {
-    // Level: calm <13, normal 13-18, elevated 18-24, fear >24.
-    const levelScore =
-      vix.value < 13
-        ? 0.8
-        : vix.value <= 18
-          ? 0
-          : vix.value <= 24
-            ? -0.8
-            : -1.6;
-    // Change: a fast spike is fear; a fast drop is relief.
-    const chgScore = clamp(-vix.changePct / 10, -1.2, 1.2);
-    sum += levelScore + chgScore;
+    // INTRADAY-FIRST: the day change is the live fear signal; the level is
+    // context (a high-but-falling VIX means fear is cooling today).
+    const levelScore = vix.value < 13 ? 0.4 : vix.value <= 18 ? 0 : vix.value <= 24 ? -0.5 : -1.2;
+    const chgScore = clamp(-vix.changePct / 6, -2, 2); // a 12%+ VIX day saturates the sub-score
+    sum += levelScore * 0.6 + chgScore * 1.4;
     parts += 2;
 
     readings.push(

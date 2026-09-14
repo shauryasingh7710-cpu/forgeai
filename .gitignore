@@ -12,3 +12,4 @@ __pycache__/
 next-env.d.ts
 .freebuff/
 .next/
+.cache/
